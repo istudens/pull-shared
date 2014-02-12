@@ -31,12 +31,12 @@ import org.eclipse.egit.github.core.service.CommitService;
 import org.eclipse.egit.github.core.service.IssueService;
 import org.eclipse.egit.github.core.service.PullRequestService;
 import org.eclipse.egit.github.core.service.RepositoryService;
+import org.jboss.pull.shared.evaluators.PullEvaluatorUtil;
+import org.jboss.pull.shared.spi.PullEvaluator;
 
 import java.io.IOException;
 import java.util.ArrayList;
-import java.util.HashMap;
 import java.util.List;
-import java.util.Map;
 import java.util.Properties;
 import java.util.regex.Matcher;
 import java.util.regex.Pattern;
@@ -48,84 +48,59 @@ import java.util.regex.Pattern;
  */
 public class PullHelper {
 
-//    alternative way configure in property file, better configuration but hard to debug
-//    private static Pattern BUGZILLA_ID_PATTERN;
-//    private static Pattern UPSTREAM_PATTERN;
-//    private static Pattern BUILD_OUTCOME_PATTERN;
     private static final Pattern BUGZILLA_ID_PATTERN = Pattern.compile("bugzilla\\.redhat\\.com/show_bug\\.cgi\\?id=(\\d+)", Pattern.CASE_INSENSITIVE);
-    private static final Pattern UPSTREAM_PATTERN = Pattern.compile("github\\.com/(wildfly/wildfly|jbossas/jboss-eap)/pull/(\\d+)", Pattern.CASE_INSENSITIVE);
     private static final Pattern BUILD_OUTCOME = Pattern.compile("outcome was (\\*\\*)?+(SUCCESS|FAILURE|ABORTED)(\\*\\*)?+ using a merge of ([a-z0-9]+)", Pattern.CASE_INSENSITIVE);
+    private final Pattern UPSTREAM_PATTERN;
+
+    // relocate from pull-processor Processor
+    private static final Pattern PENDING = Pattern.compile(".*Build.*merging.*has\\W+been\\W+triggered.*", Pattern.CASE_INSENSITIVE | Pattern.DOTALL);
+    private static final Pattern RUNNING = Pattern.compile(".*Build.*merging.*has\\W+been\\W+started.*", Pattern.CASE_INSENSITIVE | Pattern.DOTALL);
+    private static final Pattern FINISHED = Pattern.compile(".*Build.*merging.*has\\W+been\\W+finished.*", Pattern.CASE_INSENSITIVE | Pattern.DOTALL);
+    private static final Pattern REVIEWED = Pattern.compile(".*review\\W+ok.*", Pattern.CASE_INSENSITIVE | Pattern.DOTALL);
+    private static final Pattern MERGE = Pattern.compile(".*merge\\W+this\\W+please.*", Pattern.CASE_INSENSITIVE | Pattern.DOTALL);
 
     private static final String BUGZILLA_BASE = "https://bugzilla.redhat.com/";
 
-    public static final String PM_ACK = "pm_ack";
-    public static final String QA_ACK = "qa_ack";
-    public static final String DEVEL_ACK = "devel_ack";//FIXME is it dev_ or devel_ack?
+    private final String GITHUB_ORGANIZATION;
+    private final String GITHUB_ORGANIZATION_UPSTREAM;
+    private final String GITHUB_REPO;
+    private final String GITHUB_REPO_UPSTREAM;
+    private final String GITHUB_LOGIN;
+    private final String GITHUB_TOKEN;
 
-    private static final Map<String, Flag.Status> MERGEABLE_FLAGS;
-    private static final Map<String, Flag.Status> UNMERGEABLE_FLAGS;
+    private final String BUGZILLA_LOGIN;
+    private final String BUGZILLA_PASSWORD;
 
-    static {
-        MERGEABLE_FLAGS = new HashMap<String, Flag.Status>();
-        MERGEABLE_FLAGS.put(PM_ACK, Flag.Status.POSITIVE);
-        MERGEABLE_FLAGS.put(QA_ACK, Flag.Status.POSITIVE);
-        UNMERGEABLE_FLAGS = new HashMap<String, Flag.Status>();
-        UNMERGEABLE_FLAGS.put(DEVEL_ACK, Flag.Status.NEGATIVE);
-    }
+    private final IRepositoryIdProvider repository;
+    private final RepositoryService repositoryService;
+    private final CommitService commitService;
+    private final IssueService issueService;
+    private final PullRequestService pullRequestService;
 
-    private String GITHUB_ORGANIZATION;
-    private String GITHUB_ORGANIZATION_UPSTREAM;
-    private String GITHUB_REPO;
-    private String GITHUB_REPO_UPSTREAM;
-    private String GITHUB_LOGIN;
-    private String GITHUB_TOKEN;
-    private String GITHUB_BRANCH;
+    private final Bugzilla bugzillaClient;
 
-    private String BUGZILLA_LOGIN;
-    private String BUGZILLA_PASSWORD;
+    private final Properties props;
 
-    private IRepositoryIdProvider repository;
-    private IRepositoryIdProvider repositoryUpstream;
-    private RepositoryService repositoryService;
-    private CommitService commitService;
-    private IssueService issueService;
-    private PullRequestService pullRequestService;
+    private final PullEvaluatorUtil evaluator;
 
-    private Bugzilla bugzillaClient;
-
-    private Properties props;
-
-    public PullHelper(String configurationFileProperty, String configurationFileDefault) throws Exception {
+    public PullHelper(final String configurationFileProperty, final String configurationFileDefault) throws Exception {
         try {
             props = Util.loadProperties(configurationFileProperty, configurationFileDefault);
-
-//            alternative way configure in property file, better configuration but hard to debug
-//            String buildIdPattern = Util.require(props, "bugzilla.id.pattern");
-//            BUGZILLA_ID_PATTERN = Pattern.compile(buildIdPattern, Pattern.CASE_INSENSITIVE);
-//            String upstreamPattern = Util.require(props, "upstream.pattern");
-//            UPSTREAM_PATTERN = Pattern.compile(upstreamPattern, Pattern.CASE_INSENSITIVE);
-//            String buildOutcomePattern = Util.require(props, "build.outcome.pattern");
-//            BUILD_OUTCOME_PATTERN = Pattern.compile(buildOutcomePattern, Pattern.CASE_INSENSITIVE);
 
             GITHUB_ORGANIZATION = Util.require(props, "github.organization");
             GITHUB_ORGANIZATION_UPSTREAM = Util.require(props, "github.organization.upstream");
             GITHUB_REPO = Util.require(props, "github.repo");
             GITHUB_REPO_UPSTREAM = Util.require(props, "github.repo.upstream");
+            UPSTREAM_PATTERN = Pattern.compile("github\\.com/(" + GITHUB_ORGANIZATION + "/" + GITHUB_REPO + "|" + GITHUB_ORGANIZATION_UPSTREAM + "/" + GITHUB_REPO_UPSTREAM + ")/pull/(\\d+)", Pattern.CASE_INSENSITIVE);
+
             GITHUB_LOGIN = Util.require(props, "github.login");
             GITHUB_TOKEN = Util.get(props, "github.token");
-            GITHUB_BRANCH = Util.require(props, "github.branch");
-
-            String flagEapVersion = Util.get(props, "version.flag");
-            if (flagEapVersion != null && !flagEapVersion.isEmpty()) {
-                MERGEABLE_FLAGS.put(flagEapVersion, Flag.Status.POSITIVE);
-            }
 
             // initialize client and services
             GitHubClient client = new GitHubClient();
             if (GITHUB_TOKEN != null && GITHUB_TOKEN.length() > 0)
                 client.setOAuth2Token(GITHUB_TOKEN);
             repository = RepositoryId.create(GITHUB_ORGANIZATION, GITHUB_REPO);
-            repositoryUpstream = RepositoryId.create(GITHUB_ORGANIZATION_UPSTREAM, GITHUB_REPO_UPSTREAM);
             repositoryService = new RepositoryService(client);
             commitService = new CommitService(client);
             issueService = new IssueService(client);
@@ -137,6 +112,9 @@ public class PullHelper {
             // initialize bugzilla client
             bugzillaClient = new Bugzilla(BUGZILLA_BASE, BUGZILLA_LOGIN, BUGZILLA_PASSWORD);
 
+            // initialize the service evaluator
+            evaluator = new PullEvaluatorUtil(this, props);
+
         } catch (Exception e) {
             System.err.println("Cannot initialize: " + e);
             e.printStackTrace(System.err);
@@ -144,47 +122,21 @@ public class PullHelper {
         }
     }
 
-
-    public boolean isMergeable(PullRequest pull) {
-        return isMergeable(pull, null);
+    public PullEvaluator.Result isMergeable(final PullRequest pull) {
+        return evaluator.isMergeable(pull);
     }
 
-    public boolean isMergeable(PullRequest pull, Map<String, Flag.Status> requiredFlags) {
-        boolean mergeable = true;
-        mergeable = mergeable && isMergeableByUpstream(pull);
-        mergeable = mergeable && isMergeableByBugzilla(pull, requiredFlags);
-        return mergeable;
-    }
-
-    public boolean isMergeableByUpstream(final PullRequest pull) {
-        try {
-            List<PullRequest> upstreamPulls = getUpstreamPullRequest(pull);
-            if (upstreamPulls.size() == 0) {
-                return false;
-            }
-            for (PullRequest pullRequest : upstreamPulls) {
-                if (! isMerged(pullRequest)) {
-                    return false;
-                }
-            }
-        } catch (Exception ignore) {
-            System.err.printf("Cannot get an upstream pull request of the pull request %d: %s.\n", pull.getNumber(), ignore);
-            ignore.printStackTrace(System.err);
-        }
-        return true;
-    }
-
-    private boolean isMerged(final PullRequest pull) {
+    public boolean isMerged(final PullRequest pull) {
         if (pull == null) {
             return false;
         }
 
-        if (! pull.getState().equals("closed")) {
+        if (!pull.getState().equals("closed")) {
             return false;
         }
 
         try {
-            if (pullRequestService.isMerged(repositoryUpstream, pull.getNumber())) {
+            if (pullRequestService.isMerged(pull.getBase().getRepo(), pull.getNumber())) {
                 return true;
             }
         } catch (IOException ignore) {
@@ -193,48 +145,18 @@ public class PullHelper {
         }
 
         try {
-            final List<Comment> comments = issueService.getComments(repositoryUpstream, pull.getNumber());
+            final List<Comment> comments = issueService.getComments(pull.getBase().getRepo(), pull.getNumber());
             for (Comment comment : comments) {
                 if (comment.getBody().toLowerCase().indexOf("merged") != -1) {
                     return true;
                 }
-			}
+            }
         } catch (IOException ignore) {
             System.err.printf("Cannot get comments of the pull request %d: %s.\n", pull.getNumber(), ignore);
             ignore.printStackTrace(System.err);
         }
 
         return false;
-    }
-
-    public boolean isMergeableByBugzilla(PullRequest pull, Map<String, Flag.Status> requiredFlags) {
-        List<Bug> bugs = getBug(pull);
-        if (bugs.size() == 0) {
-            return false;
-        }
-
-        for (Bug bug : bugs) {
-            Map<String, Flag.Status> flagsToCheck = new HashMap<String, Flag.Status>(MERGEABLE_FLAGS);
-            if (requiredFlags != null) {
-                flagsToCheck.putAll(requiredFlags);
-            }
-
-            List<Flag> flags = bug.getFlags();
-            for (Flag flag : flags) {
-                Flag.Status bannedValue = UNMERGEABLE_FLAGS.get(flag.getName());
-                if ((bannedValue != null) && (flag.getStatus() == bannedValue)) {
-                    return false;
-                }
-                Flag.Status requiredValue = flagsToCheck.get(flag.getName());
-                if ((requiredValue != null) && (flag.getStatus() == requiredValue)) {
-                    flagsToCheck.remove(flag.getName());
-                }
-            }
-            if (! flagsToCheck.isEmpty()) {
-                return false;
-            }
-        }
-        return true;
     }
 
     public List<Integer> checkBugzillaId(String body) {
@@ -250,30 +172,22 @@ public class PullHelper {
         return ids;
     }
 
-    public Map<Integer, String> checkUpStreamPullRequestId(String body) {
-        Map<Integer, String> ids = new HashMap<Integer, String>();
-        Matcher matcher = UPSTREAM_PATTERN.matcher(body);
-        while (matcher.find()) {
-            try {
-                String organazationbranch = matcher.group(1);
-                Integer id = Integer.parseInt(matcher.group(2));
-                ids.put(id, organazationbranch);
-            } catch (NumberFormatException ignore) {
-                System.err.println("Invalid pull request number: " + ignore);
-            }
-        }
-        return ids;
-    }
-
-    public List<Bug> getBug(PullRequest pull) {
+    public List<Bug> getBug(PullRequest pull, String version) {
         List<Integer> ids = checkBugzillaId(pull.getBody());
         ArrayList<Bug> bugs = new ArrayList<Bug>();
 
         for (Integer id : ids) {
             try {
                 Bug bug = bugzillaClient.getBug(id);
-                if(bug != null)
-                    bugs.add(bug);
+                if (bug != null) {
+                    boolean add = false;
+                    for (String target : bug.getTargetRelease()) {
+                        if (target.replaceAll("(\\W|\\.)", "").equalsIgnoreCase(version))
+                            add = true;
+                    }
+                    if (add)
+                        bugs.add(bug);
+                }
             } catch (Exception ignore) {
                 System.err.printf("Cannot get a bug related to the pull request %d: %s.\n", pull.getNumber(), ignore);
             }
@@ -303,22 +217,24 @@ public class PullHelper {
     public List<PullRequest> getUpstreamPullRequest(PullRequest pull) throws IOException {
         ArrayList<PullRequest> upstreamPulls = new ArrayList<PullRequest>();
 
-        Map<Integer, String> pullIds = checkUpStreamPullRequestId(pull.getBody());
+        String upstreamOrganization = evaluator.getPullEvaluator(pull).getUpstreamOrganization().trim();
+        String upstreamRepository = evaluator.getPullEvaluator(pull).getUpstreamRepository().trim();
+        String organizationRepo = upstreamOrganization + "/" + upstreamRepository;
 
-        for (Integer key : pullIds.keySet()) {
-            String organazationbranch = pullIds.get(key);
-            String[] organazation_repo = organazationbranch.split("/");
-            if (organazation_repo.length != 2)
-                throw new RuntimeException("organazation/repository format error: " + organazationbranch);
+        Matcher matcher = UPSTREAM_PATTERN.matcher(pull.getBody());
+        while (matcher.find()) {
+            String str = matcher.group(1);
+            Integer id = Integer.parseInt(matcher.group(2));
 
-            upstreamPulls.add(pullRequestService.getPullRequest(
-                    RepositoryId.create(organazation_repo[0], organazation_repo[1]), key));
+            if (str.equalsIgnoreCase(organizationRepo))
+                upstreamPulls.add(pullRequestService.getPullRequest(RepositoryId.create(upstreamOrganization, upstreamRepository), id));
+
         }
         return upstreamPulls;
     }
 
     public void updateBugzillaStatus(PullRequest pull, Bug.Status status) throws Exception {
-        List<Bug> bugs = getBug(pull);
+        List<Bug> bugs = getBug(pull, evaluator.getPullEvaluator(pull).getVersion());
         for (Bug bug : bugs) {
             bugzillaClient.updateBugzillaStatus(bug.getId(), status);
         }
@@ -345,6 +261,68 @@ public class PullHelper {
         }
     }
 
+    public boolean isPendingMatched(Comment comment) {
+        if (PENDING.matcher(comment.getBody()).matches())
+            return true;
+        return false;
+    }
+
+    public boolean isRunningMatched(Comment comment) {
+        if (RUNNING.matcher(comment.getBody()).matches())
+            return true;
+        return false;
+    }
+
+    public boolean isFinishedgMatched(Comment comment) {
+        if (FINISHED.matcher(comment.getBody()).matches())
+            return true;
+        return false;
+    }
+
+    public boolean isReviewMatched(Comment comment) {
+        if (REVIEWED.matcher(comment.getBody()).matches())
+            return true;
+        return false;
+
+    }
+
+    public boolean isMergeMatched(Comment comment) {
+        if (MERGE.matcher(comment.getBody()).matches())
+            return true;
+        return false;
+    }
+
+    public boolean isReviewed(PullRequest pullRequest) {
+        List<Comment> comments = null;
+        try {
+            comments = issueService.getComments(repository, pullRequest.getNumber());
+        } catch (IOException e) {
+            System.err.println("Error to get comments for pull request : " + pullRequest.getNumber());
+            e.printStackTrace(System.err);
+            return false;
+        }
+        for (Comment comment : comments) {
+            if (isReviewMatched(comment))
+                return true;
+        }
+        return false;
+    }
+
+    public boolean isMergeRequested(PullRequest pullRequest) {
+        List<Comment> comments = null;
+        try {
+            comments = issueService.getComments(repository, pullRequest.getNumber());
+        } catch (IOException e) {
+            System.err.println("Error to get comments for pull request : " + pullRequest.getNumber());
+            e.printStackTrace(System.err);
+            return false;
+        }
+        for (Comment comment : comments) {
+            if (isMergeMatched(comment))
+                return true;
+        }
+        return false;
+    }
 
     public Properties getProps() {
         return props;
@@ -356,10 +334,6 @@ public class PullHelper {
 
     public IRepositoryIdProvider getRepository() {
         return repository;
-    }
-
-    public IRepositoryIdProvider getRepositoryUpstream() {
-        return repositoryUpstream;
     }
 
     public CommitService getCommitService() {
@@ -374,11 +348,11 @@ public class PullHelper {
         return pullRequestService;
     }
 
-    public String getGithubBranch() {
-        return GITHUB_BRANCH;
-    }
-
     public String getGithubLogin() {
         return GITHUB_LOGIN;
+    }
+
+    public PullEvaluatorUtil getEvaluator() {
+        return evaluator;
     }
 }
