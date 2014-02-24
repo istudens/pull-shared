@@ -19,7 +19,7 @@
  * Software Foundation, Inc., 51 Franklin St, Fifth Floor, Boston, MA
  * 02110-1301 USA, or see the FSF site: http://www.fsf.org.
  */
-package org.jboss.pull.shared;
+package org.jboss.pull.shared.connectors.bugzilla;
 
 import java.net.MalformedURLException;
 import java.net.URL;
@@ -30,7 +30,7 @@ import org.apache.xmlrpc.XmlRpcException;
 import org.apache.xmlrpc.client.XmlRpcClient;
 import org.apache.xmlrpc.client.XmlRpcClientConfigImpl;
 
-import org.jboss.pull.shared.Flag.Status;
+import org.jboss.pull.shared.connectors.bugzilla.Flag.Status;
 
 public class Bugzilla {
 
@@ -152,12 +152,46 @@ public class Bugzilla {
 
         XmlRpcClient rpcClient = getClient();
         try {
+            rpcClient.execute("Bug.update", objParams);
+            return true;
+        } catch (XmlRpcException e) {
+            e.printStackTrace();
+        } finally {
+            rpcClient = null;
+        }
+        return false;
+    }
 
-            Object resultObj = rpcClient.execute("Bug.update", objParams);
-            @SuppressWarnings("unchecked")
-            Map<Object, Object> resultMap = (Map<Object, Object>) resultObj;
-            int id = (Integer) resultMap.get("id");
-            return id == bugzillaId;
+    public boolean updateBugzillaTargetMilestone(final int ids, final String taregtMilestone) {
+        Map<Object, Object> params = getParameterMap();
+
+        params.put("ids", ids);
+        params.put("target_milestone", taregtMilestone);
+        Object[] objParams = { params };
+
+        XmlRpcClient rpcClient = getClient();
+        try {
+            rpcClient.execute("Bug.update", objParams);
+            return true;
+        } catch (XmlRpcException e) {
+            e.printStackTrace();
+        } finally {
+            rpcClient = null;
+        }
+        return false;
+    }
+
+    public boolean updateBugzillaTargetRelease(final int ids, final String... targetRelease) {
+        Map<Object, Object> params = getParameterMap();
+
+        params.put("ids", ids);
+        params.put("target_release", targetRelease);
+        Object[] objParams = { params };
+
+        XmlRpcClient rpcClient = getClient();
+        try {
+            rpcClient.execute("Bug.update", objParams);
+            return true;
         } catch (XmlRpcException e) {
             e.printStackTrace();
         } finally {
